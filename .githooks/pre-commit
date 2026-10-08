@@ -1,0 +1,12 @@
+#!/bin/sh
+# Pre-commit secret scan: gitleaks checks the staged changes before every
+# commit. It fails closed: no gitleaks, no commit. Enable once per clone:
+#   sh scripts/install-hooks.sh
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks is not installed, so the secret scan can't run. Install it (brew install gitleaks) and commit again." >&2
+  exit 1
+fi
+if ! gitleaks git --pre-commit --staged --redact --no-banner --exit-code 1 . >&2; then
+  echo "pre-commit: possible secret in the staged changes. Take it out (rotate it if it was real), then commit again." >&2
+  exit 1
+fi
