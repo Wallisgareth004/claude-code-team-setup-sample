@@ -3,10 +3,13 @@
 
 1. Secret files are blocked: .env files, anything under secrets/ or ~/.ssh,
    private keys and cloud credentials, whether reached by Read, Edit, Write,
-   Grep or a shell command such as `cat .env`.
+   Grep (its path or glob) or a shell command such as `cat .env` or `cat .en?`.
 2. Risky commands ask first: pushes, destructive git, recursive deletes,
    sudo, piping a download into a shell, publishing a package. A force push
-   is denied outright.
+   is denied outright, also behind `git -C dir` or inside `bash -c "..."`.
+3. The commands settings.json allows without a prompt stay read-only: git
+   diff/log/show with --output, --ext-diff or --textconv, and pytest with
+   --basetemp, -p, -c or --rootdir, are denied.
 
 Everything else passes untouched. A command the hook can't parse asks rather
 than guesses. Standard library only; the tests in tests/test_guard.py show
@@ -17,6 +20,7 @@ that reads a secret inside itself is out of its sight. The permission rules
 in settings.json are the first layer; this hook is the second.
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -30,6 +34,27 @@ KEY_NAMES = re.compile(
 )
 SEPARATORS = {";", "&&", "||", "|", "&", "\n"}
 SHELLS = {"sh", "bash", "zsh"}
+ENV_SAMPLES = (".env", ".env.local", ".env.production")
+GLOB_CHARS = set("*?[")
+# Options before git's subcommand; the ones in GIT_GLOBAL_WITH_VALUE take the next token.
+GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+# git diff/log/show/format-patch are allowed without a prompt, so the flags that
+# make them write a file or run an outside program are denied.
+GIT_READ_SUBS = {"diff", "log", "show", "format-patch"}
+GIT_WRITE_FLAGS = ("--output", "--ext-diff", "--textconv")
+# pytest is allowed without a prompt: --basetemp deletes the folder it names, and
+# -p / -c / --rootdir load plugins or config from elsewhere.
+PYTEST_DENY = ("--basetemp", "--config-file", "--rootdir")
+DOWNLOAD_SUBST = re.compile(r"[$<]\([^)]*\b(curl|wget)\b")
+MAX_DEPTH = 3
+
+
+def env_glob(pattern):
+    """True when a shell glob such as .en? or .env* would match an env file."""
+    name = pattern.replace("\\", "/").split("/")[-1]
+    if not GLOB_CHARS & set(name) or not name.startswith((".", "[")):
+        return False
+    return any(fnmatch.fnmatchcase(sample, name) for sample in ENV_SAMPLES)
 
 
 def is_secret(path):
@@ -40,7 +65,7 @@ def is_secret(path):
     name = parts[-1]
     if name.endswith(SAFE_SUFFIXES):
         return False
-    if name == ".env" or name.startswith(".env."):
+    if name == ".env" or name.startswith(".env.") or env_glob(name):
         return True
     if "secrets" in parts[:-1] or name == "secrets":
         return True
@@ -91,9 +116,27 @@ def risky(tokens, piped):
         return "ask", "publishes a package"
     if cmd == "twine" and args[:1] == ["upload"]:
         return "ask", "publishes a package"
-    if cmd != "git" or not args:
+    if cmd in ("pytest", "py.test") or (
+        cmd.startswith("python") and args[:2] == ["-m", "pytest"]
+    ):
+        flags = args if cmd in ("pytest", "py.test") else args[2:]
+        for i, a in enumerate(flags):
+            if a.split("=", 1)[0] in PYTEST_DENY or a in ("-c",) or a.startswith("-c="):
+                return "deny", f"runs pytest with {a.split('=', 1)[0]}, which can delete a folder or load outside config"
+            if a.startswith("-p") and not a.startswith("--"):
+                value = a[2:].lstrip("=") or (flags[i + 1] if i + 1 < len(flags) else "")
+                if not value.startswith("no:"):
+                    return "deny", "runs pytest with -p, which loads a plugin from outside the tests"
+        return None
+    if cmd != "git":
+        return None
+    while args and args[0].startswith("-"):  # git -C dir / -c k=v before the subcommand
+        args = args[2:] if args[0] in GIT_GLOBAL_WITH_VALUE else args[1:]
+    if not args:
         return None
     sub, rest = args[0], args[1:]
+    if sub in GIT_READ_SUBS and any(a.split("=", 1)[0] in GIT_WRITE_FLAGS for a in rest):
+        return "deny", f"runs git {sub} with a flag that writes a file or runs an outside program"
     if sub == "push":
         if any(a in ("--force", "-f") or a.startswith("--force=") for a in rest) or any(
             a.startswith("+") for a in rest
@@ -126,10 +169,18 @@ def decide(data):
         path = ti.get("path") or ""
         if is_secret(path) or is_secret(os.path.join(path, "x")):
             return "deny", SECRET_REASON.format(path)
+        glob = ti.get("glob") or ""
+        if glob and (is_secret(glob) or env_glob(glob)):
+            return "deny", SECRET_REASON.format(glob)
         return None
     if tool != "Bash":
         return None
-    command = ti.get("command") or ""
+    return check_command(ti.get("command") or "")
+
+
+def check_command(command, depth=0):
+    if depth > MAX_DEPTH:
+        return "ask", "The guard couldn't follow this command's nesting, so it asks."
     try:
         parts = segments(command)
     except ValueError:
@@ -138,10 +189,18 @@ def decide(data):
             "The guard couldn't parse this command, so it asks rather than guesses.",
         )
     ask = None
+    if DOWNLOAD_SUBST.search(command):
+        ask = ("ask", "This command runs downloaded text. Check it before it runs.")
     for tokens, piped in parts:
         for t in tokens[1:]:
             if is_secret(t):
                 return "deny", SECRET_REASON.format(t)
+        if tokens and os.path.basename(tokens[0]) in SHELLS and "-c" in tokens[1:-1]:
+            inner = check_command(tokens[tokens.index("-c", 1) + 1], depth + 1)
+            if inner and inner[0] == "deny":
+                return inner
+            if inner and ask is None:
+                ask = inner
         hit = risky(tokens, piped)
         if hit and hit[0] == "deny":
             return "deny", f"Blocked: this {hit[1]}."

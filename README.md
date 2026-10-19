@@ -9,11 +9,11 @@ It is the sample deliverable for an offer: "Claude Code setup for a small team".
 | Path | What it does |
 |---|---|
 | `.claude/settings.json` | Permission rules. **Denied:** reading or editing `.env` files, `secrets/`, `~/.ssh`, `~/.aws`. **Ask first:** `git push`, `git reset --hard`, `git clean`, branch deletes, recursive deletes, `sudo`, `npm publish`. **Allowed without a prompt:** status, diff, log and the test command. Bypass-permissions mode is switched off. |
-| `.claude/hooks/guard.py` | A second layer that runs before each tool call. It blocks secrets however they're reached (`Read`, `Grep`, or `cat .env` in the shell), asks before risky commands even inside a chain (`npm test && git push`), and **blocks force pushes**. A command it can't parse asks rather than guesses. |
+| `.claude/hooks/guard.py` | A second layer that runs before each tool call. It blocks the common ways secrets are reached (`Read`, `Grep`, `cat .env` or `cat .en?` in the shell), asks before risky commands even inside a chain (`npm test && git push`) or `bash -c "..."`, and **blocks force pushes**. It also keeps the pre-allowed commands read-only: `git diff`/`log` with `--output` and pytest with `--basetemp` or `-p` are denied. A command it can't parse asks rather than guesses. |
 | `CLAUDE.md` | A template for the repo's instructions: commands, layout, conventions and the guard rails, in about 30 lines. |
 | `.claude/skills/pr-description/` | An example project skill: it drafts a pull-request description from the branch diff, read-only. |
 | `.githooks/pre-commit` | A [gitleaks](https://github.com/gitleaks/gitleaks) scan of the staged changes. It **fails closed**: with no gitleaks installed, no commit. |
-| `tests/` | 25 tests that show each guard firing, and everyday work not being slowed down. |
+| `tests/` | 34 tests that show each guard firing, and everyday work not being slowed down. |
 
 ## Use it
 ```sh
@@ -32,6 +32,7 @@ Standard library only. The pre-commit tests build throwaway git repos in a temp 
 ## Limits (read these)
 - The hook reads the **command text**. A script that opens a secret from inside itself is out of its sight; the permission rules and keeping secrets out of the repo are the real fix.
 - Permission rules match file **reads and edits** (`Read(...)`, `Edit(...)`). Claude Code checks writes against `Edit(...)` rules, so there are no `Write(...)` rules here: they would look like protection and do nothing.
+- The `python3 -m pytest` and `npm test` allow rules run the checked-out branch's own test code (`conftest.py`, `package.json` scripts) without a prompt. Review an outside contributor's branch before letting Claude run its tests.
 - This is a guard rail for an honest assistant making mistakes, not a sandbox against a determined attacker.
 
 ## Licence
